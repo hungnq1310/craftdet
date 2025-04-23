@@ -22,6 +22,9 @@ from PIL import ImageFont, ImageDraw, Image
 
 from python.craftdet.utils import client
 
+from trism import TritonModel
+
+
 #############
 # Initialize
 #############
@@ -31,11 +34,27 @@ MODEL_NAME    = os.getenv("MODEL_NAME")
 MODEL_VERSION = os.getenv("MODEL_VERSION", "")
 BATCH_SIZE    = int(os.getenv("BATCH_SIZE", 1))
 #
-TRITON_URL           = os.getenv("TRITON_URL", "localhost:8000")
+TRITON_URL    = os.getenv("TRITON_URL", "localhost:8000")
 PROTOCAL      = os.getenv("PROTOCOL", "HTTP")
 VERBOSE       = os.getenv("VERBOSE", "False").lower() in ("true", "1", "t")
 ASYNC_SET     = os.getenv("ASYNC_SET", "False").lower() in ("true", "1", "t")
 #
+grpc = PROTOCAL.lower() == "grpc"
+# -----------------------------------------------------------------------------
+model = TritonModel(
+    model=MODEL_NAME,
+    version=MODEL_VERSION,
+    url=TRITON_URL,
+    grpc=grpc
+)
+# View metadata.
+for inp in model.inputs:
+  print(f"name: {inp.name}, shape: {inp.shape}, datatype: {inp.dtype}\n")
+for out in model.outputs:
+  print(f"name: {out.name}, shape: {out.shape}, datatype: {out.dtype}\n")
+
+# -------------------------------------------------------------------------------
+
 
 ##################################
 """Define images app to store image after process"""
@@ -59,49 +78,6 @@ OCR_TEXT_PATH.mkdir(exist_ok=True)
 # Config
 ############
 
-try:
-    if PROTOCAL.lower() == "grpc":
-        # Create gRPC client for communicating with the server
-        triton_client = grpcclient.InferenceServerClient(
-            url=TRITON_URL, verbose=VERBOSE
-        )
-    else:
-        # Specify large enough concurrency to handle the number of requests.
-        concurrency = 20 if ASYNC_SET else 1
-        triton_client = httpclient.InferenceServerClient(
-            url=TRITON_URL, verbose=VERBOSE, concurrency=concurrency
-        )
-except Exception as e:
-    print("client creation failed: " + str(e))
-    sys.exit(1)
-
-try:
-    model_metadata = triton_client.get_model_metadata(
-        model_name=MODEL_NAME, model_version=MODEL_VERSION
-    )
-    model_config = triton_client.get_model_config(
-        model_name=MODEL_NAME, model_version=MODEL_VERSION
-    )
-except InferenceServerException as e:
-    print("failed to retrieve model metadata: " + str(e))
-    sys.exit(1)
-
-if PROTOCAL.lower() == "grpc":
-    model_config = model_config.config
-else:
-    model_metadata, model_config = client.convert_http_metadata_config(
-        model_metadata, model_config
-    )
-
-# parsing information of model
-max_batch_size, input_name, output_name, format, dtype = client.parse_model(
-    model_metadata, model_config
-)
-
-supports_batching = max_batch_size > 0
-if not supports_batching and BATCH_SIZE != 1:
-    print("ERROR: This model doesn't support batching.")
-    sys.exit(1)
 
 class ImageBatchRequest(BaseModel):
     images: List[np.ndarray]
@@ -198,89 +174,37 @@ async def detect(request: ImageBatchRequest):
     
 @app.post("/detect/vietocr")
 def vietocr(request: ImageBatchRequest):
-    # image crops
-    inputs, outputs = requestGenerator(request.images, "IMAGE",  ["OUTPUT"], np.float32)
-    # Perform inference
-    if PROTOCAL.lower() == "grpc":
-        user_data = client.UserData()
-        response = triton_client.async_infer(
-            MODEL_NAME,
-            inputs,
-            partial(client.completion_callback, user_data),
-            model_version=MODEL_VERSION,
-            outputs=outputs,
-        )
-    else:
-        async_request = triton_client.async_infer(
-            MODEL_NAME,
-            inputs,
-            model_version=MODEL_VERSION,
-            outputs=outputs,
-        )
-    
-    # Collect results from the ongoing async requests
-    if PROTOCAL.lower() == "grpc":
-        (response, error) = user_data._completed_requests.get()
-        if error is not None:
-            return {"Error": "Inference failed with error: " + str(error)}
-    else:
-        # HTTP
-        response = async_request.get_result()
-    
-    # Process the results
-    # get output and return response
-    outputs = response.as_numpy("SENTENCE")
-    return JSONResponse(content={"sentence": outputs}, status_code=status.HTTP_200_OK)
 
+    images = request.images
+    assert len(images) > 0, "No image found after processing"
+
+    try:
+        start_time = time.time()
+        outputs = model.run(data = [images])
+        end_time = time.time()
+        print("Process time: ", end_time - start_time)
+        return JSONResponse(outputs)
+    except InferenceServerException as e:
+        return {"Error": "Inference failed with error: " + str(e)}
+    except Exception as e:
+        return {"Error": "An unexpected error occurred: " + str(e)}
 
 
     
 @app.post("/detect/craftdet")
 def craftdet(request: ImageBatchRequest):
-    #TODO:  
-    inputs, outputs = requestGenerator(request.images, "IMAGE", ["285", "onnx:Conv_275"], np.float32)
-    # Perform inference
+    images = request.images
+    assert len(images) > 0, "No image found after processing"
     try:
         start_time = time.time()
-
-        if PROTOCAL.lower() == "grpc":
-            user_data = client.UserData()
-            response = triton_client.async_infer(
-                MODEL_NAME,
-                inputs,
-                partial(client.completion_callback, user_data),
-                model_version=MODEL_VERSION,
-                outputs=outputs,
-            )
-        else:
-            async_request = triton_client.async_infer(
-                MODEL_NAME,
-                inputs,
-                model_version=MODEL_VERSION,
-                outputs=outputs,
-            )
+        outputs = model.run(data = [images])
+        end_time = time.time()
+        print("Process time: ", end_time - start_time)
+        return JSONResponse(outputs)
     except InferenceServerException as e:
         return {"Error": "Inference failed with error: " + str(e)}
-
-    # Collect results from the ongoing async requests
-    if PROTOCAL.lower() == "grpc":
-        (response, error) = user_data._completed_requests.get()
-        if error is not None:
-            return {"Error": "Inference failed with error: " + str(error)}
-    else:
-        # HTTP
-        response = async_request.get_result()
-
-    # Process the results    
-    end_time = time.time()
-    print("Process time: ", end_time - start_time)
-    
-    # get output and return response
-    # Get outputs
-    outputs1 = response.as_numpy("boxes")
-    outputs2 = response.as_numpy("boxes_as_ratio")
-    return JSONResponse(content={"boxes": outputs1, "boxes_as_ratio": outputs2})
-
+    except Exception as e:
+        return {"Error": "An unexpected error occurred: " + str(e)}
 
 
 @app.get("/ocr")
